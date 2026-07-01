@@ -1,0 +1,452 @@
+---
+title: 'Economic Outlook Report: Forecasting Bay Area Rental Housing Pressure'
+author: "Kanwar"
+date: "2026-05-19"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  cache = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4.8,
+  out.width = "85%"
+)
+
+library(fpp3)
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(zoo)
+library(readr)
+library(knitr)
+```
+
+# Introduction
+
+This report provides an economic outlook for rental housing pressure in the San Francisco, Oakland, and Hayward metropolitan area. I use Rent CPI as the main variable because it gives a consistent monthly measure of rent movement over time. Since Rent CPI is an index, the results should be interpreted as rental pressure rather than a specific dollar rent amount.
+
+The report also includes housing permits and the 30 year fixed mortgage rate. Housing permits represent the supply side of the housing market because they measure new housing units authorized for construction. Mortgage rates represent affordability and demand conditions because higher borrowing costs can make homeownership less affordable, which may keep more households in the rental market.
+
+# Data and Variable Selection
+
+The analysis uses three monthly time series. Rent CPI is the main forecast variable and serves as a proxy for rental housing pressure. Housing permits are used as a supply side variable because they show new housing units authorized for construction. The 30 year mortgage rate is used as a demand and affordability variable because mortgage rates affect the rent versus buy decision.
+
+I replaced unemployment with mortgage rates because mortgage rates are more directly connected to housing affordability. While unemployment measures general labor market conditions, mortgage rates directly affect whether households can afford to buy a home or may need to remain renters.
+
+
+```{r load_data}
+dir.create("data", showWarnings = FALSE)
+
+read_fred_monthly <- function(series_id, value_name) {
+  
+  local_file <- paste0("data/", series_id, ".csv")
+  
+  if (file.exists(local_file)) {
+    raw_data <- read_csv(local_file, show_col_types = FALSE)
+  } else {
+    fred_url <- paste0(
+      "https://fred.stlouisfed.org/graph/fredgraph.csv?id=",
+      series_id
+    )
+    
+    raw_data <- read_csv(fred_url, show_col_types = FALSE)
+    write_csv(raw_data, local_file)
+  }
+  
+  raw_data %>%
+    rename(
+      Date = observation_date,
+      Value = all_of(series_id)
+    ) %>%
+    mutate(
+      Date = as.Date(Date),
+      Month = yearmonth(Date),
+      Value = as.numeric(Value)
+    ) %>%
+    group_by(Month) %>%
+    summarize(
+      Value = mean(Value, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    rename(!!value_name := Value)
+}
+
+rent <- read_fred_monthly("CUURA422SEHA", "Rent_CPI")
+
+permits <- read_fred_monthly("SANF806BPPRIV", "Permits")
+
+mortgage <- read_fred_monthly("MORTGAGE30US", "Mortgage_Rate")
+
+housing_data <- rent %>%
+  left_join(permits, by = "Month") %>%
+  left_join(mortgage, by = "Month") %>%
+  arrange(Month) %>%
+  as_tsibble(index = Month) %>%
+  fill_gaps() %>%
+  fill(
+    Rent_CPI,
+    Permits,
+    Mortgage_Rate,
+    .direction = "downup"
+  ) %>%
+  filter(Month >= yearmonth("1990 Jan")) %>%
+  mutate(
+    log_Rent_CPI = log(Rent_CPI),
+    diff_log_Rent_CPI = difference(log_Rent_CPI)
+  )
+```
+
+
+# Visual Overview of the Time Series
+
+```{r plot_main_series, fig.width=9, fig.height=7}
+housing_data %>%
+  select(Month, Rent_CPI, Permits, Mortgage_Rate) %>%
+  pivot_longer(
+    cols = c(Rent_CPI, Permits, Mortgage_Rate),
+    names_to = "Series",
+    values_to = "Value"
+  ) %>%
+  ggplot(aes(x = Month, y = Value)) +
+  geom_line() +
+  facet_wrap(~ Series, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Bay Area Rental Housing Pressure Indicators",
+    subtitle = "Rent CPI, housing permits, and 30 year mortgage rate",
+    x = "Month",
+    y = "Value"
+  ) +
+  theme_minimal()
+```
+The three series show different parts of the housing market. Rent CPI has a strong upward trend, which suggests that rental pressure has generally increased over time. Housing permits are much more volatile because development activity changes with financing conditions, construction costs, local policy, and the timing of projects. Mortgage rates move with broader financial conditions and are important because they affect the cost of buying a home.
+
+Overall, the visual evidence suggests that Rent CPI is trend driven, permits are volatile, and mortgage rates capture housing affordability conditions.
+
+# Transformation and Stationarity
+
+Rent CPI has a clear upward trend, which means the series is nonstationary. A nonstationary series does not move around one fixed average. This matters because ARIMA models usually work better when the data is more stable over time.
+
+To address this, I take the log of Rent CPI and also look at the differenced log series. The log transformation helps model proportional changes in rent pressure, while differencing helps remove the upward trend. This makes the series more appropriate for ARIMA modeling.
+
+## Log Transformation of Rent CPI
+
+```{r log_transformation_plot, fig.width=9, fig.height=5}
+housing_data %>%
+  select(Month, Rent_CPI, log_Rent_CPI) %>%
+  pivot_longer(
+    cols = c(Rent_CPI, log_Rent_CPI),
+    names_to = "Series",
+    values_to = "Value"
+  ) %>%
+  ggplot(aes(x = Month, y = Value)) +
+  geom_line() +
+  facet_wrap(~ Series, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Rent CPI and Log Rent CPI",
+    subtitle = "The log transformation helps model proportional changes in rent pressure",
+    x = "Month",
+    y = "Value"
+  ) +
+  theme_minimal()
+```
+
+## Differenced Log Rent CPI
+
+```{r differenced_log_plot, fig.width=9, fig.height=4}
+housing_data %>%
+  filter(!is.na(diff_log_Rent_CPI)) %>%
+  ggplot(aes(x = Month, y = diff_log_Rent_CPI)) +
+  geom_line() +
+  labs(
+    title = "Differenced Log Rent CPI",
+    subtitle = "This transformation helps remove the upward trend for ARIMA modeling",
+    x = "Month",
+    y = "Differenced Log Rent CPI"
+  ) +
+  theme_minimal()
+```
+The differenced log Rent CPI series is more stable than the original Rent CPI series. Instead of modeling the raw index level, this transformation focuses on changes in rent pressure over time. This is useful because ARIMA models are designed to work better when the series is closer to stationary.
+
+# ACF and PACF Model Building
+
+The ACF and PACF plots are used to help guide ARIMA model selection. The ACF shows how current values are related to past values across different lags. The PACF shows the direct relationship between the current value and past lags after controlling for shorter lags.
+
+This step is important because it shows that the ARIMA model is not being selected blindly. Instead, the model choice is guided by the autocorrelation structure of the transformed Rent CPI series.
+
+## Autocorrelation Structure of Differenced Log Rent CPI
+
+```{r acf_log_rent, fig.width=8, fig.height=4}
+housing_data %>%
+  filter(!is.na(diff_log_Rent_CPI)) %>%
+  ACF(diff_log_Rent_CPI) %>%
+  autoplot() +
+  labs(
+    title = "ACF of Differenced Log Rent CPI",
+    subtitle = "Used to evaluate remaining autocorrelation after differencing"
+  ) +
+  theme_minimal()
+```
+
+```{r pacf_log_rent, fig.width=8, fig.height=4}
+housing_data %>%
+  filter(!is.na(diff_log_Rent_CPI)) %>%
+  PACF(diff_log_Rent_CPI) %>%
+  autoplot() +
+  labs(
+    title = "PACF of Differenced Log Rent CPI",
+    subtitle = "Used to guide ARIMA order selection"
+  ) +
+  theme_minimal()
+```
+The ACF and PACF plots show that the differenced log Rent CPI series still has autocorrelation at several lags. There are also signs of seasonal structure. This supports the use of ARIMA models with both regular and seasonal terms. The final ARIMA specifications include both nonseasonal and seasonal terms, which is consistent with the ACF and PACF evidence.
+
+# Decomposition of Rent CPI
+
+STL decomposition is used to separate Rent CPI into trend, seasonal, and remainder components. This helps show whether the series is mainly driven by a long term trend, seasonal movement, or irregular short term changes.
+
+```{r stl_decomposition, fig.width=9, fig.height=7}
+housing_data %>%
+  model(
+    STL = STL(Rent_CPI ~ trend(window = 13) + season(window = "periodic"))
+  ) %>%
+  components() %>%
+  autoplot() +
+  labs(
+    title = "STL Decomposition of Rent CPI",
+    subtitle = "Rent CPI is mainly driven by trend and persistence"
+  ) +
+  theme_minimal()
+```
+
+The decomposition shows that the trend is the dominant feature of Rent CPI. Seasonality is present, but it is much smaller than the long run trend. This suggests that the main forecasting challenge is capturing the persistent upward movement in rental pressure. This helps explain why models that account for trend and persistence are important. Since Log ARIMA models proportional changes after transformation and includes seasonal ARIMA terms, it performs best in the forecast comparison.
+
+# Model Strategy and Forecast Evaluation
+
+I compare several forecasting models. ETS is included because it captures level, trend, and seasonality. ARIMA is included because it is a standard time series model that handles autocorrelation and nonstationarity. Log ARIMA is included to test whether taking the log of Rent CPI improves ARIMA performance. Seasonal Naive is included as a simple benchmark. ARIMAX models are included to test whether housing permits and mortgage rates improve forecasting accuracy.
+
+The final 24 months are held out as the test period. This allows the models to be evaluated based on out of sample forecast accuracy instead of only how well they fit the past.
+
+
+```{r train_test_split}
+model_data <- housing_data %>%
+  filter(
+    !is.na(Rent_CPI),
+    !is.na(Permits),
+    !is.na(Mortgage_Rate),
+    !is.na(log_Rent_CPI)
+  )
+
+test_months <- 24
+
+train_data <- model_data %>%
+  slice(1:(nrow(model_data) - test_months))
+
+test_data <- model_data %>%
+  slice((nrow(model_data) - test_months + 1):nrow(model_data))
+```
+
+## Forecasting Models
+
+```{r fit_models}
+fit_models <- train_data %>%
+  model(
+    ETS = ETS(Rent_CPI),
+    ARIMA = ARIMA(Rent_CPI),
+    LOG_ARIMA = ARIMA(log(Rent_CPI)),
+    SNAIVE = SNAIVE(Rent_CPI),
+    ARIMAX_MORTGAGE = ARIMA(Rent_CPI ~ Permits + Mortgage_Rate),
+    LOG_ARIMAX_MORTGAGE = ARIMA(log(Rent_CPI) ~ Permits + Mortgage_Rate)
+  )
+```
+
+The fitted models include ETS, ARIMA, Log ARIMA, Seasonal Naive, ARIMAX with mortgage rates, and Log ARIMAX with mortgage rates. The model output shows that both ARIMA and Log ARIMA include seasonal terms, which is consistent with the ACF and PACF plots. This means the final ARIMA specifications are using information from the time series structure rather than only relying on a simple automatic model.
+
+```{r forecast_test}
+fc_test <- fit_models %>%
+  forecast(new_data = test_data)
+```
+
+## Forecast Accuracy Comparison
+
+```{r accuracy_table}
+accuracy_table <- fc_test %>%
+  accuracy(test_data) %>%
+  select(.model, RMSE, MAE, MAPE, MASE, ACF1) %>%
+  arrange(RMSE)
+
+accuracy_table %>%
+  mutate(
+    RMSE = round(RMSE, 3),
+    MAE = round(MAE, 3),
+    MAPE = round(MAPE, 3),
+    MASE = round(MASE, 3),
+    ACF1 = round(ACF1, 3)
+  ) %>%
+  knitr::kable(
+    caption = "Forecast Accuracy Comparison Across Models"
+  )
+```
+
+The forecast accuracy results show that Log ARIMA is the best performing model. Log ARIMA has the lowest RMSE of 2.557, the lowest MAE of 1.999, and the lowest MAPE of 0.386. This means that taking the log of Rent CPI improves ARIMA performance and also outperforms ETS in the modern sample.
+
+Log ARIMAX with mortgage rates is the second best model, with an RMSE of 2.849. This suggests that adding mortgage rates and permits to the logged model provides some useful information, but it does not outperform the simpler Log ARIMA model. ETS performs worse than Log ARIMA in this updated sample, with an RMSE of 6.950.
+
+Overall, the model comparison shows that the log transformation is important. Modeling proportional changes in Rent CPI provides better out of sample forecast accuracy than modeling the raw index level.
+
+## Model Ranking by RMSE
+
+```{r accuracy_plot, fig.width=8, fig.height=5}
+accuracy_table %>%
+  mutate(.model = fct_reorder(.model, RMSE)) %>%
+  ggplot(aes(x = .model, y = RMSE)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Model Comparison by Test Set RMSE",
+    subtitle = "Lower RMSE indicates better forecast accuracy",
+    x = "Model",
+    y = "RMSE"
+  ) +
+  theme_minimal()
+```
+
+The RMSE plot confirms the same result visually. Log ARIMA has the lowest forecast error, followed by Log ARIMAX with mortgage rates. Seasonal Naive performs the worst, which means simply repeating last year’s value is not enough to capture the movement in Rent CPI. The graph makes the model ranking easier to see than the table alone.
+
+## Test Period Forecast Performance
+
+```{r test_forecast_plot, fig.width=9, fig.height=5}
+fc_test %>%
+  autoplot(test_data, level = NULL) +
+  autolayer(train_data, Rent_CPI, alpha = 0.5) +
+  labs(
+    title = "Test Period Forecast Comparison",
+    subtitle = "Forecasts are compared against the final 24 months of observed Rent CPI",
+    x = "Month",
+    y = "Rent CPI"
+  ) +
+  theme_minimal()
+```
+
+The test period forecast plot compares the competing models against the actual Rent CPI values in the held out period. Log ARIMA tracks the test period more closely than the other models, which is consistent with the accuracy table. This supports using Log ARIMA as the preferred model for the final forecast.
+
+```{r best_model_name}
+best_model_name <- accuracy_table %>%
+  slice_min(RMSE, n = 1, with_ties = FALSE) %>%
+  pull(.model)
+```
+
+# Residual Diagnostics
+
+The residual diagnostics show that the Log ARIMA residuals are centered near zero and do not show strong remaining autocorrelation. The Ljung Box p value for Log ARIMA is 0.297, which is above 0.05. This means we do not reject the null hypothesis that the residuals behave like white noise.
+
+This supports Log ARIMA as the preferred model because it performs best in out of sample forecast accuracy and also has acceptable residual diagnostics.
+
+```{r residual_diagnostics_best, fig.width=9, fig.height=7}
+fit_models %>%
+  select(all_of(best_model_name)) %>%
+  gg_tsresiduals()
+```
+
+## Ljung Box Test
+
+```{r ljung_box_test}
+ljung_table <- fit_models %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 24, dof = 0) %>%
+  arrange(lb_pvalue)
+
+ljung_table %>%
+  mutate(
+    lb_stat = round(lb_stat, 3),
+    lb_pvalue = round(lb_pvalue, 3)
+  ) %>%
+  kable(
+    caption = "Ljung Box Residual Diagnostic Test"
+  )
+```
+
+The Ljung Box test supports the selection of Log ARIMA. The Log ARIMA model has a Ljung Box p value of 0.297, which is above 0.05. This suggests that there is no strong evidence of remaining autocorrelation in the residuals. In other words, the model captures the main time series structure reasonably well.
+
+The Log ARIMAX Mortgage model also has an acceptable Ljung Box p value of 0.310, but it does not outperform Log ARIMA in the forecast accuracy comparison. Therefore, Log ARIMA is selected as the preferred model because it has both the lowest out of sample forecast errors and acceptable residual diagnostics.
+
+
+```{r final_models}
+final_fit <- model_data %>%
+  model(
+    ETS = ETS(Rent_CPI),
+    ARIMA = ARIMA(Rent_CPI),
+    LOG_ARIMA = ARIMA(log(Rent_CPI)),
+    ARIMAX_MORTGAGE = ARIMA(Rent_CPI ~ Permits + Mortgage_Rate),
+    LOG_ARIMAX_MORTGAGE = ARIMA(log(Rent_CPI) ~ Permits + Mortgage_Rate)
+  )
+```
+
+# Final 24 Month Forecast
+
+```{r final_forecast, fig.width=9, fig.height=5}
+final_fc <- final_fit %>%
+  select(all_of(best_model_name)) %>%
+  forecast(h = "24 months")
+
+final_fc %>%
+  autoplot(model_data, level = c(80, 95)) +
+  labs(
+    title = "Final 24 Month Forecast for Bay Area Rent CPI",
+    subtitle = paste("Final forecast using", best_model_name),
+    x = "Month",
+    y = "Rent CPI"
+  ) +
+  theme_minimal()
+```
+After comparing the models, Log ARIMA is refit using the full available sample. I then use the fitted Log ARIMA model to produce a 24 month forecast for Bay Area Rent CPI.
+
+The final Log ARIMA forecast suggests that Bay Area Rent CPI will continue rising over the next 24 months. The forecast increases from about 533.803 in May 2026 to about 573.290 by April 2028. This suggests that rental housing pressure is expected to remain elevated over the forecast horizon.
+
+Since Rent CPI is an index, this should not be interpreted as a forecast of actual dollar rents. Instead, it shows that the rent index is expected to continue increasing based on historical patterns.
+
+
+## Forecast Table
+
+```{r final_forecast_table}
+final_fc %>%
+  as_tibble() %>%
+  select(Month, .model, .mean) %>%
+  mutate(.mean = round(.mean, 3)) %>%
+  kable(
+    caption = "Final 24 Month Rent CPI Forecast"
+  )
+```
+
+# Economic Outlook and Policy Relevance
+
+The forecast suggests that rental housing pressure in the Bay Area is likely to remain elevated. This matters because rising rent pressure affects affordability, household location decisions, labor mobility, and housing policy.
+
+This analysis could be useful for city planning departments, county housing offices, California HCD, HUD, ABAG, MTC, local housing authorities, developers, lenders, property managers, and affordable housing organizations. The forecast could help inform housing production targets, zoning reform, permitting timelines, affordable housing funding, workforce housing planning, rental assistance, and tenant support programs.
+
+# Limitations
+
+There are several limitations. First, Rent CPI is an index and does not show actual dollar rents. It also does not capture differences by neighborhood, unit size, or income group. Second, housing permits are not completed housing units. A permitted unit may take time to be built, and some permitted units may not be completed.
+
+Third, the mortgage rate is a national series rather than a Bay Area specific variable. It is still useful because mortgage financing conditions affect local housing markets, but it does not capture local credit conditions perfectly. Fourth, ARIMAX requires future values of permits and mortgage rates for true future forecasts. Since those values are unknown, the final forecast focuses on Log ARIMA, which can forecast Rent CPI using the historical Rent CPI series alone.
+
+Finally, time series models rely on historical patterns. Unexpected changes in interest rates, migration, employment, construction costs, or housing policy could cause actual Rent CPI to differ from the forecast.
+
+# Conclusion
+
+This report forecasts Bay Area rental housing pressure using Rent CPI, housing permits, and the 30 year mortgage rate. The updated modeling strategy responds to the feedback by adding Log ARIMA, showing ACF and PACF plots, replacing unemployment with a housing affordability variable, and comparing forecast accuracy across multiple models.
+
+The results show that Log ARIMA is the preferred model. Log ARIMA improves on regular ARIMA and also outperforms ETS in the modern sample. The Log ARIMAX model with mortgage rates performs second best, which suggests that mortgage rates and permits provide some useful information, but the simpler Log ARIMA model still produces the strongest out of sample forecast.
+
+The final Log ARIMA forecast suggests that Bay Area Rent CPI will continue rising over the next 24 months, which points to continued elevated rental housing pressure. Overall, the analysis is useful because it connects forecasting results to housing affordability, policy planning, and real estate decision making.
+
